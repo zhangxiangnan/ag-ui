@@ -1,6 +1,7 @@
 import { Observable, Subject } from "rxjs";
-import { HttpEvent, HttpEventType } from "../run/http-request";
+import { HttpEvent } from "../run/http-request";
 import { type DebugLoggerInput, resolveDebugLogger } from "@/debug-logger";
+import { readSSEFrames } from "./sse-frames";
 
 /**
  * Maximum size the framing buffer is allowed to reach before the stream fails.
@@ -14,7 +15,7 @@ import { type DebugLoggerInput, resolveDebugLogger } from "@/debug-logger";
  * Counted in decoded characters rather than bytes, because the buffer is
  * already a string at the point of the check.
  */
-export const MAX_BUFFER_SIZE = 10 * 1024 * 1024;
+export { MAX_BUFFER_SIZE } from "./sse-frames";
 
 /**
  * Parses a stream of HTTP events into a stream of JSON objects using Server-Sent Events (SSE) format.
@@ -34,55 +35,11 @@ export const parseSSEStream = (
   const log = resolveDebugLogger(debugLogger);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matches the exported Observable<any> above
   const jsonSubject = new Subject<any>();
-  // Create TextDecoder with stream option set to true to handle split UTF-8 characters
-  const decoder = new TextDecoder("utf-8", { fatal: false });
-  let buffer = "";
-
   // Subscribe to the source once and multicast to all subscribers
-  source$.subscribe({
-    next: (event: HttpEvent) => {
-      if (event.type === HttpEventType.HEADERS) {
-        return;
-      }
-
-      if (event.type === HttpEventType.DATA && event.data) {
-        // Decode chunk carefully to handle UTF-8
-        const text = decoder.decode(event.data, { stream: true });
-        buffer += text;
-
-        // Process complete events (separated by double newlines)
-        const events = buffer.split(/\n\n/);
-        // Keep the last potentially incomplete event in buffer
-        buffer = events.pop() || "";
-
-        for (const event of events) {
-          processSSEEvent(event);
-        }
-
-        // Measured on the tail that is left once completed events have been
-        // taken out, because that tail is the only thing here that can grow
-        // without bound. Measuring the incoming chunk instead would fail a
-        // read that merely carried two valid events across one boundary, and
-        // whether that happens is decided by how the transport grouped its
-        // reads rather than by anything the stream did wrong.
-        if (buffer.length > MAX_BUFFER_SIZE) {
-          jsonSubject.error(
-            new Error(
-              `SSE buffer size exceeded maximum limit of ${MAX_BUFFER_SIZE / (1024 * 1024)} MB`,
-            ),
-          );
-          return;
-        }
-      }
-    },
+  readSSEFrames(source$).subscribe({
+    next: processSSEEvent,
     error: (err) => jsonSubject.error(err),
-    complete: () => {
-      // SSE dispatch requires a terminating blank line. EOF must discard any
-      // pending data, even if it happens to contain a complete JSON value.
-      // https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation
-      buffer = "";
-      jsonSubject.complete();
-    },
+    complete: () => jsonSubject.complete(),
   });
 
   /**
