@@ -4,9 +4,11 @@ This is an **agent-requested** manual browser step expressed with existing AG-UI
 1.0 interrupts and Activity events. It proposes an example/documentation
 contribution, not a new protocol event or a public browser-control SDK.
 
-The browser is a deterministic stand-in. The HTTP server, SSE encoding and
-published-shape `HttpAgent` client path are real. No model, Chrome, CDP, browser
-cookies, screenshots or external login service is involved.
+The CLI uses a deterministic browser fixture. An additional local workbench
+connects a real Chrome page through an asynchronous cooperative page driver.
+Both use the real HTTP/SSE transport and `HttpAgent` client path. The workbench
+runs HttpAgent in Node, with browser controls and DOM reads in Chrome; it does
+not integrate CDP, an external login service, or arbitrary-site automation.
 
 ## Run
 
@@ -54,8 +56,10 @@ completion of a real browser task.
 
 The coordinator claims each transition before awaiting driver work. Missing,
 unknown, duplicate, cross-owner, cross-thread, expired and reused-run requests
-are rejected before changing ownership. A failed transition closes the fixture
-and emits `RUN_ERROR`; uncertain browser actions are not automatically retried.
+are rejected before changing ownership. Readiness probes and close acknowledgements
+are awaited. A failed transition attempts cleanup and emits `RUN_ERROR`;
+uncertain browser actions are not automatically retried. Unconfirmed cleanup
+projects `control: "unknown"`, never a successful cancellation.
 Expired interrupts can still be explicitly cancelled.
 
 ## Validation
@@ -70,8 +74,8 @@ pnpm exec nx run @ag-ui/client:test --excludeTaskDependencies -- src prototypes/
 Validated on upstream `c31e1e819e3a3c3b4af14add04f5b9a9a0208cae`, independently
 of the SSE metadata prototype and EOF fix:
 
-- 20 new tests, including three real loopback HTTP/SSE `HttpAgent` flows.
-- Combined client source + example suite: 1,407 tests in 112 files passed.
+- 27 example tests, including four real loopback HTTP/SSE `HttpAgent` flows.
+- Combined client source + example suite: 1,414 tests in 112 files passed.
 - Client build, separate strict example typecheck, example lint and formatting.
 - Standalone automatic-continuation and interactive cancellation demo paths.
 - Mutation checks: tests fail when ownership checks, concurrent transition
@@ -98,9 +102,10 @@ The boundary is intentional:
 - The loopback server injects a fixed principal to model prior authentication;
   it is a test/demo transport, not a deployable authenticated browser service.
 - The browser port must implement real driver mutual exclusion, draining and
-  revocation. Here agent-operation draining is exercised with a controlled
-  promise; human input is synchronous, and an asynchronous handback is simulated
-  in tests. Actual browser events, navigation and login readiness are untested.
+  revocation. The workbench exercises real DOM input, queued asynchronous manual
+  operations, and revocation of a cooperative page. Agent-operation draining is
+  still exercised with a controlled promise. Navigation, cross-origin frames,
+  real login readiness, and CDP/process shutdown remain untested.
 - Browser resources and pending interrupts are in memory. Process restart,
   snapshot hydration, lost-response recovery and automatic reconnect are not
   implemented. Duplicate requests are rejected, not replayed idempotently.
@@ -110,9 +115,56 @@ The boundary is intentional:
   finishes. Conversely, transport disconnect is not a user cancellation signal.
 - Forced user takeover in the middle of an arbitrary running agent is outside
   this first example. The agent explicitly asks for the manual step.
-- Real cancellation of an in-flight browser action and driver shutdown failures
-  require a real driver integration. The port's `close()` contract is idempotent,
-  non-throwing revocation; the host remains responsible for cleanup failures.
+- `close()` may reject. Success means input was revoked and accepted work drained;
+  failure means cleanup is unconfirmed. The host must own a recovery/disposal
+  policy for a real browser process. The test page can discard its own queued
+  DOM write; this does not prove cancellation of an external request or side effect.
 
 References: [interrupt/resume](https://docs.ag-ui.com/spec/1.0/basic/patterns/interrupt-resume),
 [Activity](https://docs.ag-ui.com/spec/1.0/events/activity).
+
+## Real-browser workbench and validation
+
+```sh
+pnpm exec tsx sdks/typescript/packages/client/prototypes/browser-handoff/browser-workbench.ts
+# Open the printed loopback URL in Chrome. Stop with Ctrl-C after testing.
+```
+
+Use **New session** between cases. Sessions live until the test server stops.
+The server checks Host and POST Origin and binds only to loopback; its fixed
+principal and page driver are demo scaffolding, not production authentication.
+The page driver is cooperative: revocation disables this page's controls, not
+Chrome's native UI. There is no claim of arbitrary-site access enforcement.
+
+Manually exercised with real Chrome clicks and observed DOM/AG-UI events on
+2026-11-23 (no Playwright/CDP substitute for the browser):
+
+| Case                                              | Observed result                                                                                                      |
+| ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| Request human control                             | Requesting run ends with interrupt; human buttons enabled; zero agent reads                                          |
+| Return before completing step                     | HTTP 409; retains human control; a later completed step can succeed                                                  |
+| Complete and return                               | One agent DOM read; success; input disabled; pending interrupts cleared                                              |
+| Complete, start delayed input, immediately return | `transferring`, input disabled, zero reads while work pending; eventually one read and success                       |
+| Start delayed input, immediately cancel           | `closing`, no cancellation success while work pending; then closed/cancelled; zero reads; one late DOM write blocked |
+| Change page during handback                       | Second asynchronous readiness probe returns false; zero reads; cleanup and RUN_ERROR                                 |
+| Fail close acknowledgement, cancel                | One close attempt; RUN_ERROR and unknown control; no false cancelled outcome; page can still be human-controlled     |
+| Disconnect driver, cancel                         | Local page revokes input; server cannot confirm cleanup, reports unknown/RUN_ERROR; zero reads                       |
+
+The real-browser adapter exposed assumptions not represented by the original
+synchronous fixture:
+
+1. Readiness is asynchronous. Both probes must be awaited, and the transition
+   lock must be acquired **before** the first probe. Failed preflight leaves the
+   run ID reusable, and the lock is released so cancellation remains possible.
+2. Close is asynchronous and fallible. Await its acknowledgement before terminal
+   success/cancellation. Do not retry an uncertain close or claim cleanup succeeded.
+3. The real client retains a pending interrupt after RUN_ERROR. A UI must also
+   consider host terminal failure, rather than enabling handback solely from the
+   pending-interrupt list. This is recorded in a real HTTP client regression;
+   it is not asserted to be a protocol or SDK bug.
+
+Seven additional regression tests cover these boundaries. Re-running them against
+the original coordinator produced six failures (one passed); restoring the fix
+passed all 27 example tests and all 1,414 combined client/example tests. Strict
+typechecking, example lint and formatting also pass. The changes remain
+application-level recipe improvements; no protocol event or SDK API was added.

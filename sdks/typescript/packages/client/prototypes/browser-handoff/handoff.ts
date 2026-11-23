@@ -14,11 +14,11 @@ export interface BrowserControl {
   // Revoke human input and drain it before granting agent commands.
   returnToAgent(): Promise<void>;
   // Read authoritative browser state, including after human input has drained.
-  manualStepComplete(): boolean;
+  manualStepComplete(): boolean | Promise<boolean>;
   performManualStep(): void;
   readAsAgent(): Promise<string>;
-  // Idempotent, non-throwing revocation; a real host also owns driver cleanup.
-  close(): void;
+  // Idempotent revocation; completion confirms input is revoked and drained.
+  close(): void | Promise<void>;
 }
 
 export class HandoffRejected extends Error {}
@@ -94,16 +94,32 @@ export class BrowserHandoff {
         ) {
           throw new HandoffRejected("Expected only { action: 'continue' }");
         }
-        // The reply is an intention to continue, not proof of login/readiness.
-        if (!this.browser.manualStepComplete()) {
-          throw new HandoffRejected("Browser has not completed the manual step");
-        }
       }
     }
 
     // Claim synchronously, before any browser await. Two requests cannot both resume.
     this.busy = true;
+    // An asynchronous readiness probe also owns the transition lock. A negative
+    // probe is retryable and does not consume the run ID.
+    try {
+      if (this.phase === "waiting" && answer!.status !== "cancelled") {
+        if (!(await this.browser.manualStepComplete())) {
+          throw new HandoffRejected("Browser has not completed the manual step");
+        }
+        if (this.expired()) throw new HandoffRejected("Human control lease expired");
+      }
+    } catch (error) {
+      this.busy = false;
+      throw error;
+    }
     this.usedRuns.add(input.runId);
+    let closeAttempted = false;
+    let closed = false;
+    const close = async () => {
+      closeAttempted = true;
+      await this.browser.close();
+      closed = true;
+    };
     const events: BaseEvent[] = [
       { type: EventType.RUN_STARTED, threadId: input.threadId, runId: input.runId },
     ];
@@ -130,7 +146,7 @@ export class BrowserHandoff {
           outcome: { type: "interrupt", interrupts: [this.pending] },
         } as BaseEvent);
       } else if (answer!.status === "cancelled") {
-        this.browser.close();
+        await close();
         this.phase = "done";
         this.pending = undefined;
         events.push(this.activity("none", "cancelled"), {
@@ -143,10 +159,12 @@ export class BrowserHandoff {
         await this.browser.returnToAgent();
         // Recheck after the drain: a lease may expire while human input settles.
         if (this.expired()) throw new Error("Lease expired during handback");
-        if (!this.browser.manualStepComplete()) throw new Error("Browser changed during handback");
+        if (!(await this.browser.manualStepComplete()))
+          throw new Error("Browser changed during handback");
+        if (this.expired()) throw new Error("Lease expired during readiness probe");
         events.push(this.activity("agent", "resumed"));
         const result = await this.browser.readAsAgent();
-        this.browser.close();
+        await close();
         this.phase = "done";
         this.pending = undefined;
         const messageId = randomUUID();
@@ -167,11 +185,19 @@ export class BrowserHandoff {
       // Fail closed: no uncertain browser operation is automatically retried.
       this.phase = "failed";
       this.pending = undefined;
-      this.browser.close();
-      events.push(this.activity("none", "failed"), {
+      if (!closeAttempted) {
+        try {
+          await close();
+        } catch {
+          // No acknowledgement means revocation is unknown, not confirmed.
+        }
+      }
+      events.push(this.activity(closed ? "none" : "unknown", "failed"), {
         type: EventType.RUN_ERROR,
         code: "BROWSER_HANDOFF_FAILED",
-        message: "Browser control failed; this example session was closed.",
+        message: closed
+          ? "Browser control failed; this example session was closed."
+          : "Browser control failed; cleanup was not confirmed.",
       } as BaseEvent);
     } finally {
       this.busy = false;

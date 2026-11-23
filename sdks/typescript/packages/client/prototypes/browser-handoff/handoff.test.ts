@@ -305,3 +305,130 @@ describe("browser handoff recipe", () => {
     expect(browser.mode).toBe("agent");
   });
 });
+
+describe("asynchronous browser acknowledgements", () => {
+  function asyncFixture() {
+    const browser = new BrowserFixture();
+    const driver = {
+      giveToHuman: () => browser.giveToHuman(),
+      returnToAgent: () => browser.returnToAgent(),
+      manualStepComplete: vi.fn(async () => browser.manualStepComplete()),
+      performManualStep: () => browser.performManualStep(),
+      readAsAgent: () => browser.readAsAgent(),
+      close: vi.fn(async () => browser.close()),
+    };
+    const host = new BrowserHandoff(driver, "alice", "thread");
+    return { browser, driver, host };
+  }
+  it("awaits false readiness and permits retry with the same unconsumed run ID", async () => {
+    const { browser, host } = asyncFixture();
+    const { interrupt } = await request(host);
+    await expect(host.run("alice", answer(interrupt.id))).rejects.toThrow("manual step");
+    expect(browser.mode).toBe("human");
+    expect(browser.reads).toBe(0);
+    browser.performManualStep();
+    const events = await host.run("alice", answer(interrupt.id));
+    expect(events.at(-1)).toMatchObject({ outcome: { type: "success" } });
+    expect(browser.reads).toBe(1);
+  });
+  it("locks before awaiting readiness, rejecting simultaneous handback and cancel", async () => {
+    const { browser, driver, host } = asyncFixture();
+    const { interrupt } = await request(host);
+    browser.performManualStep();
+    const gate = deferred();
+    driver.manualStepComplete.mockImplementationOnce(async () => {
+      await gate.promise;
+      return true;
+    });
+    const first = host.run("alice", answer(interrupt.id));
+    await expect(
+      host.run("alice", { ...answer(interrupt.id, "cancelled"), runId: "other" }),
+    ).rejects.toThrow("transition");
+    gate.resolve();
+    await first;
+    expect(browser.reads).toBe(1);
+  });
+  it("does not report cancellation until close acknowledges revocation", async () => {
+    const { browser, driver, host } = asyncFixture();
+    const { interrupt } = await request(host);
+    const gate = deferred();
+    driver.close.mockImplementation(async () => {
+      await gate.promise;
+      browser.close();
+    });
+    let settled = false;
+    const run = host.run("alice", answer(interrupt.id, "cancelled")).then((events) => {
+      settled = true;
+      return events;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(browser.mode).toBe("human");
+    gate.resolve();
+    expect((await run).at(-1)).toMatchObject({ outcome: { type: "cancelled" } });
+    expect(browser.mode).toBe("closed");
+    expect(browser.reads).toBe(0);
+  });
+  it("reports unknown control on failed close, without retrying or claiming cancellation", async () => {
+    const { browser, driver, host } = asyncFixture();
+    const { interrupt } = await request(host);
+    driver.close.mockRejectedValue(new Error("private driver details"));
+    const events = await host.run("alice", answer(interrupt.id, "cancelled"));
+    expect(events.at(-1)).toMatchObject({
+      type: EventType.RUN_ERROR,
+      message: "Browser control failed; cleanup was not confirmed.",
+    });
+    expect(events).toContainEqual(
+      expect.objectContaining({ content: { control: "unknown", status: "failed" } }),
+    );
+    expect(events.some((event) => event.type === EventType.RUN_FINISHED)).toBe(false);
+    expect(JSON.stringify(events)).not.toContain("private driver details");
+    expect(driver.close).toHaveBeenCalledTimes(1);
+    expect(browser.reads).toBe(0);
+    await expect(host.run("alice", input("retry"))).rejects.toThrow("closed");
+  });
+  it("awaits the second readiness check before any agent read", async () => {
+    const { browser, driver, host } = asyncFixture();
+    const { interrupt } = await request(host);
+    browser.performManualStep();
+    driver.manualStepComplete.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    const events = await host.run("alice", answer(interrupt.id));
+    expect(events.at(-1)?.type).toBe(EventType.RUN_ERROR);
+    expect(browser.reads).toBe(0);
+    expect(browser.mode).toBe("closed");
+  });
+  it("keeps the interrupt after RUN_ERROR; the host terminal state still forbids another handback", async () => {
+    const { browser, driver, host } = asyncFixture();
+    const server = await serve(host, "alice");
+    cleanups.push(server.close);
+    const client = new HttpAgent({ url: server.url, threadId: "thread" });
+    await client.runAgent({ runId: "request" });
+    const interrupt = client.pendingInterrupts[0]!;
+    browser.performManualStep();
+    driver.manualStepComplete.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    const events: BaseEvent[] = [];
+    await client.runAgent(
+      { runId: "answer", resume: answer(interrupt.id).resume },
+      {
+        onEvent: ({ event }) => {
+          events.push(event);
+        },
+      },
+    );
+    expect(events.at(-1)?.type).toBe(EventType.RUN_ERROR);
+    expect(client.pendingInterrupts).toHaveLength(1);
+    expect(client.messages).toMatchObject([{ content: { control: "none", status: "failed" } }]);
+    expect(browser.reads).toBe(0);
+    await expect(host.run("alice", { ...answer(interrupt.id), runId: "retry" })).rejects.toThrow(
+      "closed",
+    );
+  });
+  it("releases the lock if the preflight browser probe rejects", async () => {
+    const { driver, host } = asyncFixture();
+    const { interrupt } = await request(host);
+    driver.manualStepComplete.mockRejectedValueOnce(new Error("Browser unavailable"));
+    await expect(host.run("alice", answer(interrupt.id))).rejects.toThrow("Browser unavailable");
+    const events = await host.run("alice", answer(interrupt.id, "cancelled"));
+    expect(events.at(-1)).toMatchObject({ outcome: { type: "cancelled" } });
+  });
+});

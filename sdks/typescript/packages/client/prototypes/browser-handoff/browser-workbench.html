@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <title>AG-UI browser handoff workbench</title>
+  <style>
+    body {
+      font: 16px system-ui;
+      max-width: 1100px;
+      margin: 32px auto;
+      padding: 0 24px;
+      background: #f4f6fa;
+      color: #172438;
+    }
+    section {
+      background: white;
+      border: 1px solid #ced8e5;
+      border-radius: 12px;
+      padding: 20px;
+      margin: 16px 0;
+    }
+    button {
+      padding: 10px 16px;
+      margin: 6px;
+      cursor: pointer;
+    }
+    button:disabled {
+      cursor: default;
+    }
+    pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-size: 13px;
+    }
+    label {
+      display: inline-block;
+      margin: 12px;
+    }
+    output {
+      font-weight: bold;
+    }
+  </style>
+  <h1>Browser human handoff</h1>
+  <p>
+    Real Chrome DOM + asynchronous page driver + official HttpAgent over HTTP/SSE. Local cooperative
+    page only; no login, CDP, or arbitrary-site control.
+  </p>
+  <section>
+    <h2>Host control</h2>
+    <button id="start" disabled>Request human control</button>
+    <button id="continue" disabled>Return to agent</button>
+    <button id="cancel" disabled>Cancel session</button>
+    <button id="new">New session</button>
+    <p id="host">Connecting driver…</p>
+    <p id="error" role="alert"></p>
+  </section>
+  <section>
+    <h2>Controlled page</h2>
+    <p>
+      Control: <output id="mode">agent</output> · Page ready: <output id="ready">false</output> ·
+      Agent reads: <output id="reads">0</output> · Late writes blocked:
+      <output id="blocked">0</output>
+    </p>
+    <fieldset id="manual" disabled>
+      <legend>Human input</legend>
+      <button id="complete">Complete manual step</button>
+      <button id="reset">Reset readiness</button>
+      <button id="slow">Start delayed manual step (3s)</button>
+    </fieldset>
+    <p id="work">No manual operation pending</p>
+    <label><input id="change" type="checkbox" /> Change page during handback</label>
+    <label><input id="fail" type="checkbox" /> Fail close acknowledgement</label>
+    <label><input id="delay" type="checkbox" /> Delay close acknowledgement (3s)</label>
+    <button id="disconnect">Disconnect driver</button>
+  </section>
+  <section>
+    <h2>Observed AG-UI events</h2>
+    <pre id="events">[]</pre>
+    <h2>Client state</h2>
+    <pre id="state">{}</pre>
+    <h2>Driver trace</h2>
+    <pre id="trace"></pre>
+  </section>
+  <script type="module">
+    const el = (id) => document.getElementById(id);
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    let session,
+      stream,
+      mode = "agent",
+      generation = 0,
+      pending = Promise.resolve(),
+      reads = 0,
+      blocked = 0;
+    const trace = (message) => {
+      el("trace").textContent += message + "\n";
+    };
+    function control(next) {
+      mode = next;
+      el("mode").textContent = next;
+      el("manual").disabled = next !== "human";
+    }
+    function ready() {
+      return el("ready").textContent === "true";
+    }
+    function manual(delayed) {
+      if (mode !== "human") throw new Error("Human input revoked");
+      const epoch = generation;
+      el("work").textContent = "Manual operation pending";
+      // Queue all accepted input; the control transition drains the entire queue.
+      pending = pending.then(async () => {
+        if (delayed) await pause(3000);
+        if (epoch !== generation) {
+          el("blocked").textContent = String(++blocked);
+        } else el("ready").textContent = "true";
+        el("work").textContent = "No manual operation pending";
+      });
+    }
+    el("complete").onclick = () => manual(false);
+    el("slow").onclick = () => manual(true);
+    el("reset").onclick = () => {
+      if (mode === "human") el("ready").textContent = "false";
+    };
+    const methods = {
+      async giveToHuman() {
+        if (mode !== "agent") throw new Error("Invalid takeover");
+        control("human");
+      },
+      async returnToAgent() {
+        if (mode !== "human") throw new Error("Invalid handback");
+        control("transferring");
+        await pending;
+        if (el("change").checked) el("ready").textContent = "false";
+        control("agent");
+      },
+      async manualStepComplete() {
+        await pause(100);
+        return ready();
+      },
+      async readAsAgent() {
+        if (mode !== "agent" || !ready()) throw new Error("Agent read blocked");
+        el("reads").textContent = String(++reads);
+        return "Read the real browser DOM: manual step complete.";
+      },
+      async close() {
+        if (el("fail").checked) throw new Error("Injected close failure");
+        control("closing");
+        generation++;
+        await pending;
+        if (el("delay").checked) await pause(3000);
+        control("closed");
+      },
+    };
+    async function post(path, data = {}) {
+      const response = await fetch(path + "?session=" + session, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      return response.json();
+    }
+    async function refresh() {
+      const response = await fetch("/status?session=" + session);
+      const state = await response.json();
+      el("events").textContent = JSON.stringify(
+        state.events.map((e) => ({
+          type: e.type,
+          ...(e.content ? { content: e.content } : {}),
+          ...(e.outcome ? { outcome: e.outcome.type } : {}),
+          ...(e.code ? { code: e.code, message: e.message } : {}),
+        })),
+        null,
+        2,
+      );
+      el("state").textContent = JSON.stringify(
+        { pendingInterrupts: state.pending.length, messages: state.messages },
+        null,
+        2,
+      );
+      const last = state.events.at(-1);
+      el("host").textContent = state.busy
+        ? "Transition pending — awaiting browser acknowledgement"
+        : last?.type === "RUN_ERROR"
+          ? "Failed — see cleanup status"
+          : last?.outcome
+            ? "Outcome: " + last.outcome.type
+            : "Ready";
+      el("start").disabled =
+        state.busy || state.events.length > 0 || stream.readyState !== EventSource.OPEN;
+      // A RUN_ERROR is terminal even if a client retains an unresolved interrupt.
+      const terminal = last?.type === "RUN_ERROR";
+      el("continue").disabled = state.busy || !state.pending.length || terminal;
+      el("cancel").disabled = state.busy || !state.pending.length || terminal;
+    }
+    for (const action of ["start", "continue", "cancel"])
+      el(action).onclick = async () => {
+        el("error").textContent = "";
+        try {
+          await post("/action", { action });
+        } catch (error) {
+          el("error").textContent = error.message;
+        }
+        await refresh();
+      };
+    el("new").onclick = () => location.reload();
+    el("disconnect").onclick = () => {
+      stream.close();
+      generation++;
+      control("disconnected");
+      trace("Driver disconnected; input locally revoked");
+    };
+    const created = await fetch("/session", { method: "POST" }).then((r) => r.json());
+    session = created.id;
+    stream = new EventSource("/driver?session=" + session);
+    stream.onopen = () => refresh();
+    stream.onerror = () => {
+      generation++;
+      control("disconnected");
+      stream.close();
+      trace("Transport lost; input locally revoked");
+    };
+    stream.onmessage = async (event) => {
+      const { id, method } = JSON.parse(event.data);
+      trace("begin " + method);
+      try {
+        const value = await methods[method]();
+        trace("ack " + method + (value === undefined ? "" : ": " + value));
+        await post("/reply", { id, value });
+      } catch (error) {
+        trace("failed " + method);
+        await post("/reply", { id, error: error.message });
+      }
+    };
+    setInterval(() => refresh().catch(() => {}), 250);
+  </script>
+</html>
